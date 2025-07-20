@@ -7,11 +7,13 @@ from dataclasses import dataclass
 
 # ===== 1. Define Models =====
 # MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
-MODEL_NAME = "google/flan-t5-large"
+MODEL_NAME = "microsoft/DialoGPT-medium"  # Much better for conversation
+# MODEL_NAME = "google/flan-t5-base"
+# MODEL_NAME = "google/flan-t5-small"
 
 @dataclass
 class HFAgent:
-    model: AutoModelForCausalLM
+    model: Union[AutoModelForCausalLM, AutoModelForSeq2SeqLM]  # Fixed type annotation
     tokenizer: AutoTokenizer
     
     def __init__(self):
@@ -21,29 +23,37 @@ class HFAgent:
             bnb_4bit_compute_dtype=torch.float16
         ) if self.device == "cuda" else None
         
-        self.tokenizer = AutoConfig.from_pretrained(MODEL_NAME)
-        if self.tokenizer.is_encoder_decoder:
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        config = AutoConfig.from_pretrained(MODEL_NAME)
+        if config.is_encoder_decoder:
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 MODEL_NAME,
-                device_map="auto",
+                device_map="auto" if self.device == "cuda" else "cpu",
                 quantization_config=quantization_config,
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
             )
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 MODEL_NAME,
-                device_map="auto",
+                device_map="auto" if self.device == "cuda" else "cpu",
                 quantization_config=quantization_config,
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
             )
     
     def generate(self, prompt: str, max_tokens=256) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=0.7
-        )
+        
+        # Use appropriate generation parameters for DialoGPT
+        generation_kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repetition_penalty": 1.1,
+            "pad_token_id": self.tokenizer.eos_token_id
+        }
+        
+        outputs = self.model.generate(**inputs, **generation_kwargs)
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 # Initialize agents
@@ -59,12 +69,26 @@ class AgentState(TypedDict):
 # ===== 3. Define Nodes =====
 def chatbot_node(state: AgentState):
     """Main response generator"""
-    chat_history = "\n".join(f"{m['role']}: {m['content']}" for m in state["messages"])
-    prompt = f"""<|system|>You are a helpful assistant.</s>
-    {chat_history}
-    <|assistant|>"""
+    # Get the most recent user message
+    user_message = None
+    for message in reversed(state["messages"]):
+        if message["role"] == "user":
+            user_message = message["content"]
+            break
     
-    response = main_agent.generate(prompt)
+    if not user_message:
+        user_message = "Hello"
+    
+    # Create a conversation-friendly prompt for DialoGPT
+    prompt = f"Human: {user_message}\nAssistant:"
+    
+    response = main_agent.generate(prompt, max_tokens=150)
+    
+    # Clean up the response
+    response = response.strip()
+    if response.startswith("Assistant:"):
+        response = response[10:].strip()
+    
     return {
         "messages": [{"role": "ai", "content": response}],
         "needs_correction": False
@@ -73,13 +97,24 @@ def chatbot_node(state: AgentState):
 def fact_check_node(state: AgentState):
     """Fact-checking agent"""
     last_msg = state["messages"][-1]["content"]
-    prompt = f"""Verify if this is TRUE. Reply ONLY with 'TRUE' or 'FALSE':
-    Statement: {last_msg}
-    Answer:"""
     
-    verdict = fact_checker.generate(prompt, max_tokens=10).strip()
+    # Skip fact-checking for simple greetings or questions
+    simple_phrases = ["hello", "hi", "hey", "how are you", "what's your name", "who are you"]
+    if any(phrase in last_msg.lower() for phrase in simple_phrases):
+        print(f"Fact-Check: Skipping simple phrase")
+        return {"needs_correction": False}
+    
+    prompt = f"""Question: Is the following statement a factual claim that can be verified as true or false? Answer with only TRUE or FALSE.
+
+Statement: {last_msg}
+
+Answer:"""
+    
+    verdict = fact_checker.generate(prompt, max_tokens=5).strip().upper()
     print(f"Fact-Check Verdict: {verdict}")
-    return {"needs_correction": "FALSE" in verdict}
+    
+    # Only flag for correction if it's clearly FALSE
+    return {"needs_correction": verdict == "FALSE"}
 
 def moderator_node(state: AgentState):
     """Safety check"""
@@ -109,7 +144,7 @@ workflow.add_edge("fact_checker", "moderator")
 # Conditional self-correction
 workflow.add_conditional_edges(
     "moderator",
-    lambda state: state["needs_correction"],
+    lambda state: str(state["needs_correction"]),
     {"True": "chatbot", "False": END}
 )
 
