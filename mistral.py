@@ -30,14 +30,16 @@ class HFAgent:
                 MODEL_NAME,
                 device_map="auto" if self.device == "cuda" else "cpu",
                 quantization_config=quantization_config,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                use_safetensors=True
             )
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 MODEL_NAME,
                 device_map="auto" if self.device == "cuda" else "cpu",
                 quantization_config=quantization_config,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                use_safetensors=True
             )
     
     def generate(self, prompt: str, max_tokens=256) -> str:
